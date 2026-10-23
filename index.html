@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" id="themeColor">
+<meta name="description" content="YouTube — a fast, ad-free, no-login frontend.">
+<title>YouTube</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff0033'/%3E%3Cpath d='M13 10l10 6-10 6z' fill='white'/%3E%3C/svg%3E">
+<script>
+(() => {
+  try {
+    const saved = localStorage.getItem('dltube-theme');
+    const dark = saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+  } catch (e) {}
+})();
+</script>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="preconnect" href="https://pipedapi.dedyn.io" crossorigin>
+<link rel="preconnect" href="https://pipedproxy.dedyn.io" crossorigin>
+<link rel="preconnect" href="https://i.ytimg.com">
+<link rel="stylesheet" href="styles.css?v=20261023bi">
+</head>
+<body>
+
+<svg class="svg-defs" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <symbol id="i-menu" viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11.2 12 4l8 7.2V20a1 1 0 0 1-1 1h-4v-6H9v6H5a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-trending" viewBox="0 0 24 24"><path d="M3 16.5l6-6 4 4 7-8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 6.5h5v5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-live" viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10 10l5 3-5 3z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V6l10-2v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="16.5" cy="16" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+  <symbol id="i-news" viewBox="0 0 24 24"><rect x="3" y="5" width="15" height="15" rx="1" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M18 9h3v11H6M6 8.5h9M6 12h9M6 15.5h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-podcast" viewBox="0 0 24 24"><rect x="10" y="3" width="4" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-playlist" viewBox="0 0 24 24"><path d="M4 7h12M4 12h12M4 17h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M16 14v6l5-3z" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="i-save" viewBox="0 0 24 24"><path d="M6.5 4h11a1 1 0 0 1 1 1v15l-6.5-4L5.5 20V5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M19.07 4.93l-1.42 1.42M6.35 17.65l-1.42 1.42" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+  <symbol id="i-repeat" viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></symbol>
+  <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7zM5 5h6V3H3v18h18v-8h-2v6H5V5z"/></symbol>
+  <symbol id="i-screen" viewBox="0 0 24 24"><path d="M21 3H3a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h7v2H7v2h10v-2h-3v-2h7a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2zm0 13H3V5h18v11z"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="M12 2 1 21h22L12 2zm1 15h-2v-2h2v2zm0-4h-2V8h2v5z"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></symbol>
+  <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></symbol>
+  <symbol id="i-volume" viewBox="0 0 24 24"><path d="M3 9v6h4l5 4V5L7 9H3zm13.5 3a4.5 4.5 0 0 0-2.5-4.03v8.05A4.47 4.47 0 0 0 16.5 12zM14 3.23v2.06a6.51 6.51 0 0 1 0 13.42v2.06a8.51 8.51 0 0 0 0-17.54z"/></symbol>
+  <symbol id="i-muted" viewBox="0 0 24 24"><path d="M3 9v6h4l5 4V5L7 9H3z"/><path d="M16 10l4 4M20 10l-4 4" stroke="currentColor" stroke-width="2" stroke-linecap="round" fill="none"/></symbol>
+  <symbol id="i-back10" viewBox="0 0 24 24">
+    <path d="M12 5V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/>
+    <text x="12" y="16.6" text-anchor="middle" font-size="7" font-family="Arial, Helvetica, sans-serif" font-weight="700" fill="currentColor">10</text>
+  </symbol>
+  <symbol id="i-forward10" viewBox="0 0 24 24">
+    <g transform="translate(24 0) scale(-1 1)"><path d="M12 5V1L7 6l5 5V7a6 6 0 1 1-6 6H4a8 8 0 1 0 8-8z"/></g>
+    <text x="12" y="16.6" text-anchor="middle" font-size="7" font-family="Arial, Helvetica, sans-serif" font-weight="700" fill="currentColor">10</text>
+  </symbol>
+</svg>
+
+<header class="topbar">
+  <div class="topbar-start">
+    <button class="icon-btn" id="menuBtn" type="button" aria-label="Toggle guide">
+      <svg class="icon"><use href="#i-menu"/></svg>
+    </button>
+    <a class="brand" href="?" data-nav aria-label="YouTube home">
+      <svg class="brand-logo" viewBox="0 0 388.676 83.9" aria-hidden="true">
+        <g transform="translate(-54.079375,-137.39814)">
+          <path fill="#ff0033" d="m 114.84349,221.29866 c 0,0 38.11055,0 47.56362,-2.51702 5.32265,-1.42631 9.32554,-5.53743 10.73046,-10.61341 2.59756,-9.31296 2.59756,-28.90373 2.59756,-28.90373 0,0 0,-19.46492 -2.59756,-28.69398 -1.40492,-5.20183 -5.40781,-9.22906 -10.73046,-10.61341 -9.45307,-2.55897 -47.56362,-2.55897 -47.56362,-2.55897 0,0 -38.025522,0 -47.436056,2.55897 -5.237532,1.38435 -9.325383,5.41158 -10.815742,10.61341 -2.512317,9.22906 -2.512317,28.69398 -2.512317,28.69398 0,0 0,19.59077 2.512317,28.90373 1.490359,5.07598 5.57821,9.1871 10.815742,10.61341 9.410534,2.51702 47.436056,2.51702 47.436056,2.51702 z"/>
+          <path fill="#fff" d="m 133.78487,179.3484 -31.4627,-17.82886 v 35.65772 z"/>
+          <g fill="currentColor">
+            <path d="m 209.87592,216.68371 v -22.90484 l 14.55674,-47.57143 h -10.86511 l -5.53744,21.60439 c -1.2585,4.95013 -2.39116,10.11001 -3.23017,14.89217 h -0.6712 c -0.46145,-4.19486 -1.80386,-9.69034 -3.14627,-14.97607 l -5.36963,-21.52049 h -10.86512 l 14.34699,47.57143 v 22.90484 z"/>
+            <path d="m 239.08128,163.82655 c -12.71093,0 -17.07376,7.3413 -17.07376,23.15638 v 7.50909 c 0,14.17919 2.72677,23.07265 16.82205,23.07265 13.88554,0 16.86401,-8.47396 16.86401,-23.07265 v -7.50909 c 0,-14.13707 -2.85262,-23.15638 -16.6123,-23.15638 z m 5.41158,35.32195 c 0,6.87984 -1.21656,11.20072 -5.62134,11.20072 -4.32087,0 -5.53743,-4.36283 -5.53743,-11.20072 v -16.9479 c 0,-5.87287 0.83901,-11.11665 5.53743,-11.11665 4.95013,0 5.62134,5.53743 5.62134,11.11665 z"/>
+            <path d="m 273.35883,217.48076 c 6.12474,0 9.94221,-2.55896 13.08848,-7.17349 h 0.46146 l 0.46145,6.37644 h 8.34768 v -51.85035 h -11.07445 v 41.65644 c -1.17502,2.05556 -3.90179,3.56577 -6.46076,3.56577 -3.23017,0 -4.23655,-2.55897 -4.23655,-6.83789 V 164.83336 H 262.9128 v 38.88772 c 0,8.432 2.43353,13.75968 10.44603,13.75968 z"/>
+            <path d="m 317.63649,216.68371 v -61.87646 h 12.75288 v -8.59981 H 293.9346 v 8.59981 h 12.75287 v 61.87646 z"/>
+            <path d="m 338.80753,217.48076 c 6.12474,0 9.94221,-2.55896 13.08848,-7.17349 h 0.46145 l 0.46146,6.37644 h 8.3481 v -51.85035 h -11.07487 v 41.65644 c -1.17461,2.05556 -3.90138,3.56577 -6.46034,3.56577 -3.23017,0 -4.23698,-2.55897 -4.23698,-6.83789 v -38.38432 h -11.03292 v 38.88772 c 0,8.432 2.43312,13.75968 10.44562,13.75968 z"/>
+            <path d="m 392.51057,163.7007 c -5.36963,0 -9.22905,2.34922 -11.78802,6.16669 h -0.54535 c 0.3356,-5.03403 0.5873,-9.31296 0.5873,-12.71093 v -13.71773 h -10.69732 l -0.0419,45.05441 0.0419,28.19057 h 9.31296 l 0.79706,-5.03403 h 0.29365 c 2.47506,3.39797 6.29254,5.53743 11.36852,5.53743 8.432,0 12.03972,-7.25739 12.03972,-22.69509 v -8.0125 c 0,-14.43072 -1.63606,-22.77882 -11.36852,-22.77882 z m 0.37755,30.79132 c 0,9.64856 -1.4263,15.39575 -5.91498,15.39575 -2.09751,0 -4.99208,-1.00681 -6.29254,-2.89457 v -30.83327 c 1.13266,-2.93652 3.64967,-5.07598 6.46034,-5.07598 4.53063,0 5.74718,5.49548 5.74718,15.52142 z"/>
+            <path d="m 442.75566,185.64052 c 0,-12.50101 -1.25851,-21.77202 -15.64745,-21.77202 -13.54993,0 -16.57035,9.01931 -16.57035,22.27542 v 9.10321 c 0,12.92068 2.76871,22.31754 16.23475,22.31754 10.65536,0 16.15085,-5.32769 15.52159,-15.64745 l -9.4388,-0.5034 c -0.12586,6.37644 -1.59411,8.97735 -5.83109,8.97735 -5.32768,0 -5.57939,-5.07598 -5.57939,-12.62703 v -3.52382 h 21.31074 z m -15.89915,-14.80828 c 5.11793,0 5.49548,4.82428 5.49548,13.00442 v 4.23697 h -10.90707 v -4.23697 c 0,-8.09623 0.33561,-13.00442 5.41159,-13.00442 z"/>
+          </g>
+        </g>
+      </svg>
+    </a>
+  </div>
+
+  <form class="search" id="searchForm" role="search">
+    <label class="sr-only" for="searchInput">Search</label>
+    <div class="search-field">
+      <input id="searchInput" name="q" type="search" placeholder="Search" autocomplete="off" spellcheck="false">
+    </div>
+    <button class="search-btn" type="submit" aria-label="Search">
+      <svg class="icon"><use href="#i-search"/></svg>
+    </button>
+  </form>
+
+  <div class="topbar-end">
+    <span class="adfree standard" id="teslaBadge" title="Standard video player" hidden>Standard video</span>
+    <button class="icon-btn theme-toggle" id="themeBtn" type="button" aria-label="Switch to dark theme">
+      <svg class="icon moon-icon"><use href="#i-moon"/></svg>
+      <svg class="icon sun-icon"><use href="#i-sun"/></svg>
+    </button>
+  </div>
+</header>
+
+<aside class="guide" id="guide" aria-label="Guide">
+  <div class="guide-inner">
+    <nav>
+      <a class="guide-item" href="?" data-nav data-nav-key="home" title="Home">
+        <svg class="icon"><use href="#i-home"/></svg><span class="label">Home</span>
+      </a>
+      <a class="guide-item" href="?q=trending%20videos" data-nav data-nav-key="q:trending videos" title="Trending">
+        <svg class="icon"><use href="#i-trending"/></svg><span class="label">Trending</span>
+      </a>
+      <a class="guide-item" href="?q=live" data-nav data-nav-key="q:live" title="Live">
+        <svg class="icon"><use href="#i-live"/></svg><span class="label">Live</span>
+      </a>
+      <a class="guide-item" href="?saved" data-nav data-nav-key="saved" title="Saved">
+        <svg class="icon"><use href="#i-save"/></svg><span class="label">Saved</span>
+      </a>
+      <a class="guide-item" href="?list=PLSwvOjw-78-w" data-nav data-nav-key="playlist:PLSwvOjw-78-w" title="InMotion">
+        <svg class="icon"><use href="#i-playlist"/></svg><span class="label">InMotion</span>
+      </a>
+      <div class="guide-sep"></div>
+      <h2 class="guide-heading">Explore</h2>
+      <a class="guide-item" href="?q=music" data-nav data-nav-key="q:music" title="Music">
+        <svg class="icon"><use href="#i-music"/></svg><span class="label">Music</span>
+      </a>
+      <a class="guide-item" href="?q=news" data-nav data-nav-key="q:news" title="News">
+        <svg class="icon"><use href="#i-news"/></svg><span class="label">News</span>
+      </a>
+      <a class="guide-item" href="?q=podcasts" data-nav data-nav-key="q:podcasts" title="Podcasts">
+        <svg class="icon"><use href="#i-podcast"/></svg><span class="label">Podcasts</span>
+      </a>
+    </nav>
+    <div class="guide-footer">
+      <strong>YouTube</strong>
+      No account. No tracking. No ads.
+    </div>
+  </div>
+</aside>
+
+<main class="main" id="main">
+  <div class="view" id="view" aria-live="polite"></div>
+</main>
+
+<div class="scrim" id="scrim"></div>
+<div class="toast" id="toast" role="status"></div>
+<div class="modal" id="modal" hidden>
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-title" id="modalTitle"></div>
+    <div class="modal-text" id="modalText"></div>
+    <div class="modal-actions">
+      <button class="btn" id="modalCancel" type="button">Cancel</button>
+      <button class="btn danger" id="modalConfirm" type="button">Remove</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=20261023bi" defer></script>
+</body>
+</html>
