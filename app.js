@@ -47,8 +47,39 @@
 
   // How much already-downloaded media to keep ahead of playback. This is the
   // cushion that absorbs a slow segment fetch or a decode hiccup without the
-  // listener hearing a gap.
-  var BUFFER_TARGET_S = 12;
+  // listener hearing a gap. VOD starts at a minute and grows one second of
+  // extra buffer for every second played, up to three minutes. Live keeps a
+  // smaller cushion so it does not fall too far behind the edge.
+  var VOD_BUFFER_START_S = 60;
+  var VOD_BUFFER_MAX_S = 180;
+  // Start live playback behind the edge so the segments ahead of us already
+  // exist. That is what makes a real live cushion possible; joining at the
+  // newest segment leaves nothing available to download until it airs.
+  var LIVE_EDGE_DELAY_S = 35;
+  var LIVE_BUFFER_TARGET_S = 30;
+  // One more segment can arrive after the target is checked, so the sample
+  // queues need room for that overshoot as well.
+  var BUFFER_OVERSHOOT_S = 20;
+  var MAX_VIDEO_BUFFER_SAMPLES =
+    Math.ceil((VOD_BUFFER_MAX_S + BUFFER_OVERSHOOT_S) * 60) + 16;
+  var MAX_AUDIO_BUFFER_FRAMES =
+    Math.ceil((VOD_BUFFER_MAX_S + BUFFER_OVERSHOOT_S) * 48000 / 1024) + 16;
+
+  function bufferTargetFor(s) {
+    if (s.live) return LIVE_BUFFER_TARGET_S;
+    var elapsed = s.vT0 >= 0 ? Math.max(0, (Date.now() - s.vT0) / 1000) : 0;
+    if (elapsed > (s.maxPlayed || 0)) s.maxPlayed = elapsed;
+    return Math.min(VOD_BUFFER_MAX_S, VOD_BUFFER_START_S + Math.floor(s.maxPlayed || 0));
+  }
+
+  function liveStartIndex(segs) {
+    var total = 0;
+    for (var i = segs.length - 1; i >= 0; i--) {
+      total += Number(segs[i].dur) || 0;
+      if (total >= LIVE_EDGE_DELAY_S) return i;
+    }
+    return 0;
+  }
 
   // How far ahead of its due time audio is decoded and poured into the ring.
   // A ring holding exactly this much is playing the same media instant the
@@ -318,7 +349,7 @@
     var s = {
       url: url, meta: meta || {}, t0: Date.now(),
       fileMode: !!(meta && meta.fileUrl), fileDone: false, extractStopped: false,
-      videoOnly: !!(meta && meta.videoOnly),
+      videoOnly: !!(meta && meta.videoOnly), live: !!(meta && meta.live),
       externalClock: this.externalClock || null,
       base: url, segs: [], cursor: 0, lastUrl: null,
       target: 4, edgeLen: 0,
@@ -330,20 +361,16 @@
       paintTimer: null, pumpTimer: null, rafId: 0, statsTimer: 0,
       stopped: false, fatal: null, firstFrameAt: 0,
       paused: false, pausedAt: 0, ended: false, renderPaused: false,
-      startAt: (meta && meta.startAt) || 0, startOffset: 0,
-      // Fixed, and deliberately generous. These hold the WORST-CASE buffer -
-      // downloading happens a whole segment at a time, so the buffer oscillates
-      // between the 12s target and target+segment (~25s) - for the heaviest
-      // channel here (59.94fps, 13s segments): 2000 video samples is 33s at
-      // 60fps, and 2400 AAC frames is 36s at 48kHz.
-      //
+      startAt: (meta && meta.startAt) || 0, startOffset: 0, maxPlayed: 0,
+      // Fixed, and deliberately generous. These hold the WORST-CASE read-ahead:
+      // three minutes of VOD plus one segment of overshoot, at 60fps and 48kHz.
       // They are NOT derived from the measured frame rate. An earlier version
       // sized them from a running average of the frame intervals, and one
       // outlier timestamp was enough to shrink the cap below a single segment's
       // worth of samples - at which point the queue overflowed on every segment
       // and dropped the oldest entries, which are the frames about to be shown.
       // A fixed cap cannot have that failure mode.
-      caps: { fq: 40, v: 2000, a: 2400 },
+      caps: { fq: 40, v: MAX_VIDEO_BUFFER_SAMPLES, a: MAX_AUDIO_BUFFER_FRAMES },
       ivWin: [],
       aOutRms: 0,
       // counters
@@ -458,10 +485,7 @@
         // timestamp, so report the segment's absolute start as the clock base.
         s.startOffset = t;
       } else {
-        // Join the newest segment. Two segments back left the canvas visibly
-        // behind the live audio and could stall while waiting for a target it
-        // had not decoded yet.
-        s.cursor = Math.max(0, s.segs.length - 1);
+        s.cursor = liveStartIndex(s.segs);
       }
       self.startMux(s, gen);
     }).catch(function (e) { self.fail('playlist: ' + e.message); });
@@ -476,7 +500,7 @@
     s.vod = true;
     s.mbox = MP4Box.createFile();
     this.startMux(s, gen);
-    return fetch(s.url, { cache: 'no-store' }).then(function (r) {
+    return fetch(s.url, { cache: 'no-store', priority: 'high' }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       return r.arrayBuffer();
     }).then(function (buf) {
@@ -500,7 +524,7 @@
   // Fetch the playlist, following a master playlist to its best variant.
   TeslaPlayer.prototype.loadPlaylist = function (s, gen) {
     var self = this;
-    return fetch(s.url, { cache: 'no-store' }).then(function (r) {
+    return fetch(s.url, { cache: 'no-store', priority: 'high' }).then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
       // The starlite URL 301s to a per-session CDN host; segment paths are
       // relative to THAT, not to the URL we asked for. Resolving against the
@@ -519,7 +543,7 @@
         s.base = variant;
         s.master = true;
         s.aUrl = s.videoOnly ? null : pickAudio(text, base);
-        return fetch(variant, { cache: 'no-store' }).then(function (r2) {
+        return fetch(variant, { cache: 'no-store', priority: 'high' }).then(function (r2) {
           if (!r2.ok) throw new Error('variant HTTP ' + r2.status);
           var f2 = r2.url || variant;
           return r2.text().then(function (t2) { return { text: t2, finalUrl: f2 }; });
@@ -538,7 +562,7 @@
       s.edgeLen = p.segs.reduce(function (a, x) { return a + x.dur; }, 0);
       s.segDur = p.segs.length ? p.segs[0].dur : 4;
       if (s.aUrl) {
-        return fetch(s.aUrl, { cache: 'no-store' }).then(function (r3) {
+        return fetch(s.aUrl, { cache: 'no-store', priority: 'high' }).then(function (r3) {
           if (!r3.ok) throw new Error('audio HTTP ' + r3.status);
           var f3 = r3.url || s.aUrl;
           return r3.text().then(function (t3) { return { text: t3, finalUrl: f3 }; });
@@ -679,7 +703,7 @@
       // segment is already fMP4, so mp4box consumes it directly. The mux.js
       // transmuxer is only needed for MPEG-TS input.
       s.fmp4 = true;
-      fetch(absolute(s.map, s.base), { cache: 'no-store' }).then(function (r) {
+      fetch(absolute(s.map, s.base), { cache: 'no-store', priority: 'high' }).then(function (r) {
         if (!r.ok) throw new Error('init HTTP ' + r.status);
         return r.arrayBuffer();
       }).then(function (buf) {
@@ -711,7 +735,7 @@
 
     if (!s.fileMode && !s.videoOnly && s.aMap) {
       s.ambox = MP4Box.createFile();
-      fetch(absolute(s.aMap, s.aBase), { cache: 'no-store' }).then(function (r) {
+      fetch(absolute(s.aMap, s.aBase), { cache: 'no-store', priority: 'high' }).then(function (r) {
         if (!r.ok) throw new Error('audio init HTTP ' + r.status);
         return r.arrayBuffer();
       }).then(function (buf) {
@@ -1498,6 +1522,18 @@
 
   var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
 
+  function fetchBufferWithRetry(url, retries) {
+    return fetch(url, { cache: 'no-store', priority: 'high' }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.arrayBuffer();
+    }).catch(function (e) {
+      if (retries <= 0) throw e;
+      return sleep(800).then(function () {
+        return fetchBufferWithRetry(url, retries - 1);
+      });
+    });
+  }
+
   TeslaPlayer.prototype.pump = function (s, gen) {
     var self = this;
     if (s.pumpRunning) return;
@@ -1518,13 +1554,13 @@
           }
           return;
         }
-        fetch(s.base, { cache: 'no-store' }).then(function (r) {
+        fetch(s.base, { cache: 'no-store', priority: 'high' }).then(function (r) {
           return r.ok ? r.text() : Promise.reject(new Error('HTTP ' + r.status));
         }).then(function (t) {
           var p = parsePlaylist(t);
           if (p.segs.length) { s.segs = p.segs; s.target = p.target; s.segDur = p.segs[0].dur; }
           if (s.aBase) {
-            fetch(s.aBase, { cache: 'no-store' }).then(function (ar) {
+            fetch(s.aBase, { cache: 'no-store', priority: 'high' }).then(function (ar) {
               return ar.ok ? ar.text() : null;
             }).then(function (at) {
               if (!at) return;
@@ -1539,16 +1575,14 @@
       }
       // Pace by BUFFER DEPTH. One segment per segment-duration means media
       // arrives exactly when it is needed, so the audio ring sits at zero and
-      // every hiccup becomes a dropout.
-      if (bufferedOf(s) > BUFFER_TARGET_S) { sleep(200).then(loop); return; }
+      // every hiccup becomes a dropout. Fill well beyond that instead.
+      if (bufferedOf(s) > bufferTargetFor(s)) { sleep(200).then(loop); return; }
       var seg = s.segs[s.cursor];
       if (!seg) { sleep(100).then(loop); return; }
       s.cursor++; s.lastUrl = seg.url;
-      fetch(absolute(seg.url, s.base), { cache: 'no-store' }).then(function (r) {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.arrayBuffer();
-      }).then(function (buf) {
+      fetchBufferWithRetry(absolute(seg.url, s.base), 2).then(function (buf) {
         if (s.stopped || self.gen !== gen) return;
+        s.fetchErr = '';
         s.segsFetched++;
         if (s.fmp4) {
           self.feedMp4(s, new Uint8Array(buf));
@@ -1562,13 +1596,13 @@
         if (s.aSegs && s.aSegs.length && !s.audioFromMux) {
           var aseg = s.aSegs[Math.min(Math.max(0, s.cursor - 1), s.aSegs.length - 1)];
           if (aseg) {
-            fetch(absolute(aseg.url, s.aBase), { cache: 'no-store' }).then(function (ar) {
-              return ar.ok ? ar.arrayBuffer() : null;
-            }).then(function (abuf) {
-              if (!abuf || s.stopped || self.gen !== gen) return;
+            fetchBufferWithRetry(absolute(aseg.url, s.aBase), 1).then(function (abuf) {
+              if (s.stopped || self.gen !== gen) return;
               if (s.aAdts) self.feedAdtsAudio(s, new Uint8Array(abuf));
               else self.feedAudioMp4(s, new Uint8Array(abuf));
-            }).catch(function () {});
+            }).catch(function (e) {
+              s.aErr = 'audio segment: ' + e.message;
+            });
           }
         }
       }).catch(function (e) {
@@ -1664,6 +1698,7 @@
       aTrim: s.aTrim || 1,
       outRms: this.outRms(),
       buffered: bufferedOf(s),
+      bufferTarget: bufferTargetFor(s),
       fatal: s.fatal, fetchErr: s.fetchErr, aErr: s.aErr || '',
       firstFrameMs: s.firstFrameAt ? (s.firstFrameAt - s.t0) : 0
     };
@@ -1773,7 +1808,104 @@
   ];
   const INSTANCE_LIST_URL = 'https://api.invidious.io/instances.json?sort_by=health';
   const API_TIMEOUT = 9000;
-  const MAX_HEIGHT = 1080;
+  const DEFAULT_YATTEE_URL = 'https://yattee.vpmbd45g3cfj.opentunnel.xyz';
+  const DEFAULT_YATTEE_USER = 'xix';
+
+  function maxDefinition() {
+    try {
+      return localStorage.getItem('youtube:allow-1080') === '1' ? 1080 : 720;
+    } catch (e) {
+      return 720;
+    }
+  }
+
+  function yatteeConfig() {
+    try {
+      const saved = JSON.parse(localStorage.getItem('youtube:yattee') || 'null');
+      if (saved && typeof saved === 'object') {
+        return {
+          url: typeof saved.url === 'string' ? saved.url : DEFAULT_YATTEE_URL,
+          user: typeof saved.user === 'string' ? saved.user : DEFAULT_YATTEE_USER,
+          password: typeof saved.password === 'string' ? saved.password : ''
+        };
+      }
+    } catch (e) {}
+    return { url: DEFAULT_YATTEE_URL, user: DEFAULT_YATTEE_USER, password: '' };
+  }
+
+  function saveYatteeConfig(config) {
+    try {
+      localStorage.setItem('youtube:yattee', JSON.stringify(config));
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function yatteeEnabled() {
+    const config = yatteeConfig();
+    return Boolean(config.url.trim() && config.password);
+  }
+
+  function yatteeOnly() {
+    try {
+      return localStorage.getItem('youtube:yattee-only') === '1';
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function clearWatchCache() {
+    try {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && key.startsWith('youtube:watch:')) keys.push(key);
+      }
+      for (const key of keys) localStorage.removeItem(key);
+    } catch (e) {}
+  }
+
+  function sourceHost(value) {
+    try {
+      return new URL(value).host;
+    } catch (e) {
+      return String(value || '').replace(/^https?:\/\//, '').split('/')[0];
+    }
+  }
+
+  function streamSourceLabel(video) {
+    if (!video) return 'Unknown source';
+    if ((!video.streamSource || video.streamSource === 'public') && lastSource) {
+      video.streamSource = lastSource.type;
+      video.streamOrigin = sourceHost(lastSource.base);
+    }
+    const origin = video.streamOrigin || '';
+    if (video.streamSource === 'yattee') {
+      return origin ? `Yattee · ${origin}` : 'Yattee';
+    }
+    if (video.streamSource === 'invidious') {
+      return origin ? `Invidious · ${origin}` : 'Invidious';
+    }
+    if (video.streamSource === 'piped') {
+      return origin ? `Piped · ${origin}` : 'Piped';
+    }
+    if (origin) {
+      return `Piped · ${origin}`;
+    }
+    return 'Piped';
+  }
+
+  function basicAuthHeader(user, password) {
+    try {
+      const bytes = new TextEncoder().encode(`${user}:${password}`);
+      let binary = '';
+      for (const byte of bytes) binary += String.fromCharCode(byte);
+      return `Basic ${btoa(binary)}`;
+    } catch (e) {
+      return '';
+    }
+  }
   const ID_RE = /^[A-Za-z0-9_-]{11}$/;
   const REGION = (() => {
     try {
@@ -1793,11 +1925,14 @@
     ['Cooking', '?q=cooking']
   ];
   const listCache = new Map();
+  const publicFallbacks = new Map();
+  const fallbackAttempts = new WeakSet();
   const $ = (selector, root = document) => root.querySelector(selector);
 
   const view = $('#view');
   const searchForm = $('#searchForm');
   const searchInput = $('#searchInput');
+  const searchSuggestions = $('#searchSuggestions');
   const menuBtn = $('#menuBtn');
   const themeBtn = $('#themeBtn');
   const themeColor = $('#themeColor');
@@ -1806,6 +1941,7 @@
   let routeSeq = 0;
   let routeAbort = null;
   let currentHls = null;
+  let currentVideo = null;
   let currentEngine = null;
   let currentEngineSyncTimer = 0;
   let currentEnginePlayer = null;
@@ -1856,7 +1992,7 @@
 
   function fmtQuality(height) {
     const lines = Number(height);
-    return lines ? `${lines}p` : 'Auto';
+    return `${lines > 0 ? lines : maxDefinition()}p`;
   }
 
   function updateQualityBadge(height, fps) {
@@ -1932,10 +2068,23 @@
     return colors[Math.abs(hash) % colors.length];
   }
 
+  function directImageURL(url) {
+    try {
+      const parsed = new URL(url);
+      const host = parsed.searchParams.get('host');
+      if (host && /^[a-z0-9.-]+$/i.test(host)) {
+        return `${parsed.protocol}//${host}${parsed.pathname}`;
+      }
+    } catch (e) {}
+    return url;
+  }
+
   function avatarHTML(name, url = '') {
-    const src = String(url || '').trim();
+    const original = String(url || '').trim();
+    const src = directImageURL(original);
+    const fallback = src !== original ? original : '';
     const image = /^https?:\/\//i.test(src)
-      ? `<img class="avatar-img" src="${esc(src)}" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.remove()">`
+      ? `<img class="avatar-img" src="${esc(src)}"${fallback ? ` data-fallback="${esc(fallback)}"` : ''} alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer">`
       : '';
     return `<span class="avatar" style="--av:${channelColor(name)}" aria-hidden="true">${esc(initials(name))}${image}</span>`;
   }
@@ -1965,6 +2114,18 @@
     return match ? Number(match[1]) : 0;
   }
 
+  function formatHeight(format) {
+    const labelled = parseQualityLabel(format && format.qualityLabel);
+    if (labelled) return labelled;
+    const height = Number(format && format.height);
+    if (height > 0) return height;
+    const known = {
+      18: 360, 22: 720, 37: 1080, 43: 360, 44: 480,
+      45: 720, 46: 1080, 59: 480, 78: 480, 85: 720, 93: 1080
+    };
+    return known[String(format && format.itag)] || 0;
+  }
+
   async function fetchInvidiousInstance(base, id, signal, timeout) {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -1973,7 +2134,8 @@
     try {
       const response = await fetch(`${base}/api/v1/videos/${encodeURIComponent(id)}?local=true`, {
         signal: controller.signal,
-        headers: { Accept: 'application/json' }
+        headers: { Accept: 'application/json' },
+        priority: 'high'
       });
       if (!response.ok) throw new Error('Unexpected response');
       const data = await response.json();
@@ -1983,9 +2145,14 @@
           String(format.mimeType || '').startsWith('video/') ||
           format.itag === '18' || format.itag === '22')
       );
-      if (!formats.length && !data.hlsUrl) throw new Error('No playable stream');
-      formats.sort((a, b) => parseQualityLabel(b.qualityLabel) - parseQualityLabel(a.qualityLabel));
-      return { base, data, stream: formats[0] || null };
+      const limit = maxDefinition();
+      const capped = formats.filter((format) => {
+        const height = formatHeight(format);
+        return height > 0 && height <= limit;
+      });
+      if (!capped.length && !data.hlsUrl) throw new Error('No playable stream');
+      capped.sort((a, b) => formatHeight(b) - formatHeight(a));
+      return { base, data, stream: capped[0] || null };
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', abort);
@@ -1997,22 +2164,81 @@
     return normalizeInvidious(entry, id);
   }
 
+  async function fetchYatteeStream(id, signal) {
+    const config = yatteeConfig();
+    if (!config.url || !config.password) return null;
+    const base = config.url.replace(/\/+$/, '');
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal) signal.addEventListener('abort', abort);
+    const timer = setTimeout(() => controller.abort(), 6000);
+    try {
+      const response = await fetch(
+        `${base}/api/v1/videos/${encodeURIComponent(id)}?proxy=true&proxy_mode=relay`,
+        {
+          signal: controller.signal,
+          cache: 'no-store',
+          priority: 'high',
+          headers: {
+            Accept: 'application/json',
+            Authorization: basicAuthHeader(config.user, config.password)
+          }
+        }
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      const limit = maxDefinition();
+      const formatList = Array.isArray(data.formatStreams) ? data.formatStreams : [];
+      const hlsFormat = formatList.find((format) =>
+        format && format.url &&
+        (format.container === 'hls' ||
+          /mpegurl/i.test(String(format.mimeType || '')) ||
+          /\.m3u8(?:\?|$)/i.test(String(format.url)))
+      );
+      if (!data.hlsUrl && hlsFormat) data.hlsUrl = hlsFormat.url;
+      const formats = formatList.filter((format) =>
+        format && format.url &&
+        (format.container === 'mp4' ||
+          String(format.mimeType || '').startsWith('video/') ||
+          format.itag === '18' || format.itag === '22')
+      );
+      const capped = formats.filter((format) => {
+        const height = formatHeight(format);
+        return height > 0 && height <= limit;
+      });
+      capped.sort((a, b) => formatHeight(b) - formatHeight(a));
+      const stream = capped[0] || null;
+      const hls = data.hlsUrl ? absoluteURL(data.hlsUrl, base) : '';
+      if (!stream && !hls) return null;
+      return normalizeInvidious({ base, data, stream }, id);
+    } catch (e) {
+      if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      return null;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abort);
+    }
+  }
+
   function normalizeInvidious(entry, id) {
     const { base, data, stream } = entry;
     const avatar = (data.authorThumbnails || []).slice(-1)[0];
     const related = (data.recommendedVideos || [])
-      .map((item) => ({
-        id: item.videoId,
-        title: item.title || 'Untitled',
-        channel: item.author || 'Unknown',
-        uploaderUrl: item.authorUrl || '',
-        avatar: '',
-        views: Number(item.viewCount ?? -1),
-        duration: Number(item.lengthSeconds ?? 0),
-        live: item.liveNow === true,
-        when: item.publishedText || '',
-        description: ''
-      }))
+      .map((item) => {
+        const thumb = (item.authorThumbnails || []).slice(-1)[0];
+        return {
+          id: item.videoId,
+          title: item.title || 'Untitled',
+          channel: item.author || 'Unknown',
+          uploaderUrl: item.authorUrl || '',
+          avatar: thumb ? absoluteURL(thumb.url, base) : '',
+          views: Number(item.viewCount ?? -1),
+          duration: Number(item.lengthSeconds ?? 0),
+          live: item.liveNow === true,
+          when: item.publishedText || '',
+          description: ''
+        };
+      })
       .filter((item) => item.id && item.id !== id)
       .slice(0, 20);
     return {
@@ -2065,7 +2291,10 @@
     if (!item || typeof item !== 'object') return null;
     const id = extractVideoId(item.url || item.videoId || '');
     if (!id) return null;
-    const live = item.duration === -1 || item.livestream === true;
+    const uploadedAt = Number(item.uploaded);
+    const scheduled = Number.isFinite(uploadedAt) && uploadedAt > Date.now() + 60000;
+    const live = !scheduled && (item.duration === -1 || item.livestream === true ||
+      item.liveNow === true || item.isLive === true);
     return {
       id,
       title: item.title || 'Untitled',
@@ -2124,11 +2353,15 @@
       (track) => String(track.audioTrackType || '').toUpperCase() === 'ORIGINAL'
     );
     const videoStreams = Array.isArray(data.videoStreams) ? data.videoStreams : [];
-    const progressive = progressiveStreams(videoStreams)[0];
+    const limit = maxDefinition();
+    const progressive = progressiveStreams(videoStreams).find((stream) => {
+      const height = streamHeight(stream);
+      return height > 0 && height <= limit;
+    });
     const bestVideo = videoStreams
       .filter((stream) => {
         const height = streamHeight(stream);
-        return height > 0 && height <= MAX_HEIGHT;
+        return height > 0 && height <= limit;
       })
       .sort((a, b) => streamHeight(b) - streamHeight(a) || Number(b.fps) - Number(a.fps))[0];
     const qualityStream = data.hls ? bestVideo : progressive || bestVideo;
@@ -2165,7 +2398,12 @@
 
   function hasPlayableStream(data) {
     if (!data || !data.title) return false;
-    return Boolean(data.hls) || progressiveStreams(data.videoStreams).length > 0;
+    if (data.hls) return true;
+    const limit = maxDefinition();
+    return progressiveStreams(data.videoStreams).some((stream) => {
+      const height = streamHeight(stream);
+      return height > 0 && height <= limit;
+    });
   }
 
   function cardHTML(video) {
@@ -2284,7 +2522,8 @@
       const response = await fetch(`${base}${path}`, {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
-        cache: 'no-store'
+        cache: 'no-store',
+        priority: 'high'
       });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json();
@@ -2351,18 +2590,18 @@
     for (const base of instanceCache.invidious || []) push('invidious', base);
     if (lastSource) {
       candidates.sort((a, b) => {
-        const aPrimary = a.type === 'piped' && APIS.includes(a.base) ? 0 : 1;
-        const bPrimary = b.type === 'piped' && APIS.includes(b.base) ? 0 : 1;
-        if (aPrimary !== bPrimary) return aPrimary - bPrimary;
         const aCached = a.type === lastSource.type && a.base === lastSource.base ? 0 : 1;
         const bCached = b.type === lastSource.type && b.base === lastSource.base ? 0 : 1;
-        return aCached - bCached;
+        if (aCached !== bCached) return aCached - bCached;
+        const aPrimary = a.type === 'piped' && APIS.includes(a.base) ? 0 : 1;
+        const bPrimary = b.type === 'piped' && APIS.includes(b.base) ? 0 : 1;
+        return aPrimary - bPrimary;
       });
     }
     return candidates;
   }
 
-  async function loadStream(id, signal) {
+  function loadPublicStream(id, signal) {
     const candidates = getStreamCandidates();
     if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return new Promise((resolve, reject) => {
@@ -2405,6 +2644,8 @@
         finished = true;
         if (best && best.candidate) {
           lastSource = { type: best.candidate.type, base: best.candidate.base };
+          video.streamSource = best.candidate.type;
+          video.streamOrigin = sourceHost(best.candidate.base);
           try { localStorage.setItem('youtube:last-source', JSON.stringify(lastSource)); } catch (e) {}
         }
         cleanup();
@@ -2454,6 +2695,93 @@
       const concurrency = Math.min(12, candidates.length);
       for (let i = 0; i < concurrency; i += 1) worker();
     });
+  }
+
+  async function loadStream(id, signal, onPreview) {
+    if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    // Start the fallback now so it is already warm if Yattee fails, but do not
+    // let it win while Yattee is still working. Yattee is the preferred source.
+    // Public metadata can still paint the page immediately while Yattee is
+    // deciding, so Yattee never holds up the page itself.
+    const publicJob = loadPublicStream(id, signal).then(
+      (video) => {
+        if (video && !video.streamSource) {
+          video.streamSource = lastSource ? lastSource.type : 'piped';
+          video.streamOrigin = lastSource ? sourceHost(lastSource.base) : '';
+        }
+        if (onPreview) {
+          try { onPreview(video); } catch (e) {}
+        }
+        return { video };
+      },
+      (error) => ({ error })
+    );
+
+    if (yatteeOnly()) {
+      if (!yatteeEnabled()) {
+        throw new Error('Yattee source is forced, but no Yattee credentials are configured.');
+      }
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal) signal.addEventListener('abort', abort, { once: true });
+      try {
+        const yattee = await fetchYatteeStream(id, controller.signal).catch(() => null);
+        if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (!yattee) throw new Error('Yattee is the forced source, but it did not return a stream.');
+        yattee.streamSource = 'yattee';
+        yattee.streamOrigin = sourceHost(yatteeConfig().url);
+        return yattee;
+      } finally {
+        controller.abort();
+        if (signal) signal.removeEventListener('abort', abort);
+      }
+    }
+
+    if (yatteeEnabled()) {
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      if (signal) signal.addEventListener('abort', abort, { once: true });
+      const yatteePromise = fetchYatteeStream(id, controller.signal).catch(() => null);
+      try {
+        // Decide from the public lookup first. Live never waits on Yattee:
+        // its relay is slower and live is available directly.
+        const publicResult = await publicJob;
+        if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (publicResult.video && publicResult.video.live) {
+          controller.abort();
+          return publicResult.video;
+        }
+
+        const yattee = await yatteePromise;
+        if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (yattee) {
+          yattee.streamSource = 'yattee';
+          yattee.streamOrigin = sourceHost(yatteeConfig().url);
+          publicFallbacks.set(id, Promise.resolve(publicResult.video || null));
+          if (publicFallbacks.size > 10) {
+            publicFallbacks.delete(publicFallbacks.keys().next().value);
+          }
+          return yattee;
+        }
+        if (publicResult.video) return publicResult.video;
+        throw publicResult.error || new Error('No playable stream');
+      } finally {
+        controller.abort();
+        if (signal) signal.removeEventListener('abort', abort);
+      }
+    }
+
+    try {
+      const fallback = await publicJob;
+      if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (fallback.video) return fallback.video;
+      throw fallback.error || new Error('No playable stream');
+    } catch (e) {
+      if (signal && signal.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      throw e instanceof Error ? e : new Error('No playable stream');
+    }
   }
 
   const isListPayload = (data) =>
@@ -2510,7 +2838,9 @@
           ? `playlist:${query}`
           : type === 'saved'
             ? 'saved'
-            : '';
+            : type === 'settings'
+              ? 'settings'
+              : '';
     document.querySelectorAll('[data-nav-key]').forEach((item) => {
       item.classList.toggle('active', item.dataset.navKey === key);
     });
@@ -2548,6 +2878,119 @@
     view.innerHTML = chipsHTML() + `<div class="grid">${items.map(cardHTML).join('')}</div>`;
   }
 
+  const liveLookupCache = new Map();
+
+  function searchKey(value) {
+    return String(value || '').toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-z0-9]+/g, ' ').trim();
+  }
+
+  function channelIDFromURL(url) {
+    const match = String(url || '').match(/\/channel\/([A-Za-z0-9_-]+)/);
+    return match ? match[1] : '';
+  }
+
+  function channelMatchScore(query, name) {
+    const key = searchKey(name);
+    if (!key) return 0;
+    if (key === query) return 100;
+    if (key.startsWith(query + ' ') || query.startsWith(key + ' ')) return 75;
+    const wanted = new Set(query.split(' '));
+    const words = new Set(key.split(' '));
+    let hits = 0;
+    for (const word of wanted) if (words.has(word)) hits += 1;
+    return hits === wanted.size ? 60 : 0;
+  }
+
+  async function fetchChannelLivePrimary(tabData, signal) {
+    for (const base of APIS) {
+      try {
+        const response = await fetch(
+          `${base}/channels/tabs?data=${encodeURIComponent(tabData)}`,
+          {
+            signal,
+            cache: 'no-store',
+            priority: 'high',
+            headers: { Accept: 'application/json' }
+          }
+        );
+        if (!response.ok) continue;
+        const data = await response.json();
+        const items = (data.content || [])
+          .map(normalizeItem)
+          .filter((video) => video && video.id);
+        if (items.length) return items;
+      } catch (e) {
+        if (signal && signal.aborted) return [];
+      }
+    }
+    return [];
+  }
+
+  async function discoverChannelLive(query, items, signal) {
+    const key = searchKey(query);
+    if (!key || key.split(' ').length > 6) return { matched: false, items: [] };
+    const cached = liveLookupCache.get(key);
+    if (cached && Date.now() - cached.at < 60000) return cached.result;
+
+    const remember = (result) => {
+      liveLookupCache.set(key, { at: Date.now(), result });
+      if (liveLookupCache.size > 20) {
+        liveLookupCache.delete(liveLookupCache.keys().next().value);
+      }
+      return result;
+    };
+
+    try {
+      let best = 0;
+      let channelID = '';
+      for (const item of items) {
+        const id = channelIDFromURL(item.uploaderUrl);
+        if (!id) continue;
+        const score = channelMatchScore(key, item.channel);
+        if (score > best) {
+          best = score;
+          channelID = id;
+        }
+      }
+      if (!channelID || best < 70) {
+        const data = await cachedRace(
+          `/search?q=${encodeURIComponent(query)}&filter=channels`,
+          signal
+        );
+        const channels = data && Array.isArray(data.items) ? data.items : [];
+        for (const channel of channels) {
+          const id = channelIDFromURL(channel.url);
+          if (!id) continue;
+          let score = channelMatchScore(key, channel.name);
+          if (channel.verified) score += 5;
+          if (score > best) {
+            best = score;
+            channelID = id;
+          }
+        }
+      }
+      if (!channelID || best < 50) return remember({ matched: false, items: [] });
+
+      const channel = await fetchChannel(channelID, signal);
+      if (!channel) return remember({ matched: false, items: [] });
+      const strong = best >= 100 && Number(channel.subscribers) >= 100000;
+      const tab = (channel.tabs || []).find((entry) => /live/i.test(entry.name || ''));
+      if (!tab || !tab.data) {
+        return remember({ matched: strong, items: [] });
+      }
+      const live = await fetchChannelLivePrimary(tab.data, signal);
+      const active = live
+        .filter((video) => video.live && Number(video.views) > 0 && !video.when)
+        .slice(0, 3);
+      return remember({ matched: strong, items: active });
+    } catch (e) {
+      if (signal && signal.aborted) return { matched: false, items: [] };
+      return remember({ matched: false, items: [] });
+    }
+  }
+
   async function searchView(query, seq, signal) {
     searchInput.value = query;
     view.innerHTML = `<div class="results-page">
@@ -2566,10 +3009,42 @@
         </div>`;
         return;
       }
-      view.innerHTML = `<div class="results-page">
-        <h1 class="search-heading">Results for “${esc(query)}”</h1>
-        <div class="result-list">${items.map(resultHTML).join('')}</div>
-      </div>`;
+      const paintResults = (videos) => {
+        const liveItems = videos.filter((item) => item.live);
+        const otherItems = videos.filter((item) => !item.live);
+        const liveSection = liveItems.length
+          ? `<h2 class="section-heading">Live now</h2>
+            <div class="result-list">${liveItems.map(resultHTML).join('')}</div>`
+          : '';
+        const videoHeading = liveItems.length && otherItems.length
+          ? '<h2 class="section-heading">Videos</h2>'
+          : '';
+        const scrollY = window.scrollY;
+        view.innerHTML = `<div class="results-page">
+          <h1 class="search-heading">Results for “${esc(query)}”</h1>
+          ${liveSection}
+          ${videoHeading}
+          <div class="result-list">${otherItems.map(resultHTML).join('')}</div>
+        </div>`;
+        window.scrollTo(0, scrollY);
+      };
+      paintResults(items);
+
+      discoverChannelLive(query, items, signal).then((result) => {
+        if (!result || !result.matched || seq !== routeSeq || signal.aborted) return;
+        const seen = new Set();
+        const channelLive = result.items.filter((item) => {
+          if (seen.has(item.id)) return false;
+          seen.add(item.id);
+          return true;
+        });
+        const videos = items.filter((item) => {
+          if (item.live || seen.has(item.id)) return false;
+          seen.add(item.id);
+          return true;
+        });
+        paintResults([...channelLive, ...videos]);
+      }).catch(() => {});
     } catch (e) {
       if (seq !== routeSeq || signal.aborted) return;
       view.innerHTML = `<div class="results-page">
@@ -2651,7 +3126,7 @@
     return `<div class="watch-page">
       <div class="watch-primary">
         <div class="player-shell is-paused${video.live ? ' is-live' : ''}">
-          <video id="playerVideo" playsinline preload="metadata"></video>
+          <video id="playerVideo" playsinline preload="metadata"${!video.live && savedMuted() ? ' muted' : ''}></video>
           <canvas class="player-canvas" id="playerCanvas" hidden></canvas>
           <img class="player-poster" id="playerPoster" src="https://i.ytimg.com/vi/${video.id}/maxresdefault.jpg" alt="" draggable="false" referrerpolicy="no-referrer">
           <div class="player-status" id="playerStatus">
@@ -2719,8 +3194,11 @@
     const player = $('#playerVideo');
     let muted;
     if (engineAudioActive()) {
-      muted = currentEngine.muted ||
-        !currentEngine.actx || currentEngine.actx.state !== 'running';
+      muted = currentEngine.muted;
+    } else if (currentVideo && currentVideo.live) {
+      // Live uses the engine for audio; the native element is intentionally
+      // muted. Reflect the saved user state until engine audio is active.
+      muted = savedMuted();
     } else {
       muted = !player || player.muted || player.volume === 0;
     }
@@ -2732,6 +3210,7 @@
   }
 
   function wireWatch(video) {
+    currentVideo = video;
     const saveBtn = $('#saveBtn');
     const muteBtn = $('#muteBtn');
     const qualityBtn = $('#qualityBtn');
@@ -2832,19 +3311,10 @@
     }
   }
 
-  function showPlayerError(message, video) {
-    const status = $('#playerStatus');
-    if (!status) return;
-    const teslaBadge = $('#teslaBadge');
-    if (teslaBadge) teslaBadge.hidden = true;
+  function teardownPlayback() {
     const player = $('#playerVideo');
-    const surface = player || $('#playerCanvas');
     if (player) {
       try { player.pause(); } catch (e) {}
-    }
-    if (surface) {
-      const shell = surface.closest('.player-shell');
-      if (shell) shell.classList.add('is-error');
     }
     if (currentHls) {
       try { currentHls.destroy(); } catch (e) {}
@@ -2861,6 +3331,20 @@
     }
     currentEnginePlayer = null;
     currentEngineSeekHandler = null;
+  }
+
+  function showPlayerErrorNow(message, video) {
+    const status = $('#playerStatus');
+    if (!status) return;
+    const teslaBadge = $('#teslaBadge');
+    if (teslaBadge) teslaBadge.hidden = true;
+    const player = $('#playerVideo');
+    const surface = player || $('#playerCanvas');
+    if (surface) {
+      const shell = surface.closest('.player-shell');
+      if (shell) shell.classList.add('is-error');
+    }
+    teardownPlayback();
     status.hidden = false;
     status.innerHTML = `${icon('alert')}
       <div class="status-title">Playback unavailable</div>
@@ -2869,6 +3353,53 @@
         <button class="btn" type="button" data-retry>${icon('refresh')}<span>Try again</span></button>
         <a class="btn ghost" href="https://www.youtube.com/watch?v=${encodeURIComponent(video.id)}" target="_blank" rel="noopener">${icon('external')}<span>YouTube</span></a>
       </div>`;
+  }
+
+  function showPlayerError(message, video) {
+    if (video && currentVideo && video !== currentVideo) return;
+    if (video && video.streamSource === 'yattee' && yatteeOnly()) {
+      showPlayerErrorNow(message, video);
+      return;
+    }
+    if (video && video.streamSource === 'yattee' && !fallbackAttempts.has(video)) {
+      fallbackAttempts.add(video);
+      const seq = routeSeq;
+      const startAt = video.live
+        ? 0
+        : Math.max(0, Number($('#playerVideo') && $('#playerVideo').currentTime) || 0);
+      teardownPlayback();
+      const status = $('#playerStatus');
+      if (status) {
+        status.hidden = false;
+        status.innerHTML = `${icon('refresh')}
+          <div class="status-title">Switching to backup source…</div>
+          <div class="status-detail">The Yattee stream failed; trying the public stream.</div>`;
+      }
+      const fallback = publicFallbacks.get(video.id) ||
+        loadPublicStream(video.id, routeAbort && routeAbort.signal).catch(() => null);
+      Promise.resolve(fallback).then((alternate) => {
+        if (seq !== routeSeq) return;
+        if (!alternate) {
+          showPlayerErrorNow(message, video);
+          return;
+        }
+        publicFallbacks.delete(video.id);
+        if (!alternate.streamSource) {
+          alternate.streamSource = lastSource ? lastSource.type : 'piped';
+          alternate.streamOrigin = lastSource ? sourceHost(lastSource.base) : '';
+        }
+        currentVideo = alternate;
+        teardownPlayback();
+        view.innerHTML = watchHTML(alternate);
+        document.title = `${alternate.title} - YouTube`;
+        wireWatch(alternate);
+        startPlayer(alternate, startAt, seq);
+      }).catch(() => {
+        if (seq === routeSeq) showPlayerErrorNow(message, video);
+      });
+      return;
+    }
+    showPlayerErrorNow(message, video);
   }
 
   function findOriginalAudioIndex(tracks, video) {
@@ -2912,9 +3443,10 @@
     let bestIndex = -1;
     let bestHeight = 0;
     let bestFps = 0;
+    const limit = maxDefinition();
     (hls.levels || []).forEach((level, index) => {
       const height = Number(level.height) || 0;
-      if (height <= 0 || height > MAX_HEIGHT) return;
+      if (height <= 0 || height > limit) return;
       const fps = Number(level.attrs?.['FRAME-RATE']) || Number(level.frameRate) || 0;
       if (height > bestHeight || (height === bestHeight && fps > bestFps)) {
         bestIndex = index;
@@ -3003,7 +3535,10 @@
         }, 200);
         return;
       }
+      // Chrome refused audible autoplay. Follow policy with muted playback;
+      // the user can unmute explicitly when they are ready.
       player.muted = true;
+      updateMuteButton();
       player.play().catch(showStart);
     };
     canvas.addEventListener('click', () => {
@@ -3012,7 +3547,10 @@
     });
 
     const wasMuted = savedMuted();
-    player.muted = true;
+    // The native element owns VOD audio, while live audio comes from the
+    // engine. Keep the unused path muted, but never mute the audible path just
+    // because a new video is loading.
+    player.muted = video.live ? true : wasMuted;
     if (video.hls) {
       const Hls = await hlsPreload;
       if (!Hls || !Hls.isSupported()) {
@@ -3082,13 +3620,14 @@
       player.play().catch(startMuted);
     }
 
-    const engine = new window.TeslaPlayer({ canvas, maxWidth: 1280, maxHeight: 1080, gain: 1 });
+    const engine = new window.TeslaPlayer({ canvas, maxWidth: 1280, maxHeight: maxDefinition(), gain: 1 });
     currentEngine = engine;
-    engine.setMuted(true);
+    engine.setMuted(wasMuted);
     updateMuteButton();
     if (video.live) {
       setTimeout(() => {
-        if (seq === routeSeq && engine.actx && engine.actx.state !== 'running') {
+        if (seq === routeSeq && !player.paused &&
+            engine.actx && engine.actx.state !== 'running') {
           engine.setMuted(true);
           player.dispatchEvent(new Event('volumechange'));
         }
@@ -3104,7 +3643,7 @@
       if (video.live) engine.unlock();
     });
     const engineUrl = video.hls || video.source;
-    const engineMeta = { name: video.title, startAt: startAt || 0, fileUrl: !video.hls, videoOnly: !video.live };
+    const engineMeta = { name: video.title, startAt: startAt || 0, fileUrl: !video.hls, videoOnly: !video.live, live: !!video.live };
     const avParam = new URLSearchParams(location.search).get('av');
     let avOffset = Number(avParam);
     if (!Number.isFinite(avOffset)) avOffset = 0;
@@ -3180,7 +3719,7 @@
           }
         } else if (buffered > 0.5) {
           syncStallSince = 0;
-          if (player.paused && pausedForSync && buffered > 2) {
+          if (player.paused && pausedForSync && buffered > 1) {
             pausedForSync = false;
             if (status) status.hidden = true;
             player.play().catch(() => {});
@@ -3205,16 +3744,10 @@
     currentEnginePlayer = player;
     currentEngineSeekHandler = onSeeked;
     currentEngineSyncTimer = setInterval(syncCanvas, 250);
-    let audioReleased = false;
     engine.on('state', (state) => {
       if (seq !== routeSeq || state.stage === 'idle') return;
+      if (state.height > 0) updateQualityBadge(state.height, state.fps);
       if (state.stage === 'live') {
-        if (!audioReleased) {
-          audioReleased = true;
-          if (video.live) engine.setMuted(wasMuted);
-          else player.muted = wasMuted;
-          updateMuteButton();
-        }
         if (status) status.hidden = true;
         if (poster) poster.hidden = true;
         const teslaBadge = $('#teslaBadge');
@@ -3285,6 +3818,37 @@
         player.pause();
       }
     };
+    const bufferedEnd = (current) => {
+      if (currentEngine && typeof currentEngine.state === 'function') {
+        const state = currentEngine.state();
+        if (state && state.stage !== 'idle' && Number.isFinite(state.buffered)) {
+          return current + Math.max(0, state.buffered);
+        }
+      }
+      let end = current;
+      try {
+        const ranges = player.buffered;
+        for (let i = 0; i < ranges.length; i++) {
+          const start = ranges.start(i);
+          const rangeEnd = ranges.end(i);
+          if (start <= current + 0.5 && rangeEnd >= current) {
+            end = Math.max(end, rangeEnd);
+          }
+        }
+      } catch (e) {}
+      return end;
+    };
+    const updateBuffer = (current, duration) => {
+      if (!seek) return;
+      const playedPct = Number.isFinite(duration) && duration > 0
+        ? Math.min(100, Math.max(0, (current / duration) * 100))
+        : 0;
+      const loadedPct = Number.isFinite(duration) && duration > 0
+        ? Math.min(100, Math.max(0, (bufferedEnd(current) / duration) * 100))
+        : playedPct;
+      const pct = Math.min(100, Math.max(playedPct, loadedPct));
+      seek.style.setProperty('--buffer', `${pct}%`);
+    };
     const updateTime = () => {
       const duration = player.duration;
       const hasDuration = Number.isFinite(duration) && duration > 0;
@@ -3298,6 +3862,7 @@
         seek.value = String(Math.round(pct * 10));
         seek.style.setProperty('--seek', `${pct}%`);
       }
+      updateBuffer(current, duration);
     };
     const beginScrub = () => {
       scrubbing = true;
@@ -3378,6 +3943,7 @@
         if (!Number.isFinite(duration) || duration <= 0) return;
         const pct = Number(seek.value) / 10;
         seek.style.setProperty('--seek', `${pct}%`);
+        updateBuffer((duration * pct) / 100, duration);
         if (currentEl) currentEl.textContent = fmtDuration((duration * pct) / 100);
         try { player.currentTime = (duration * pct) / 100; } catch (e) {}
       });
@@ -3390,9 +3956,17 @@
 
     updateTime();
     setPlayState();
+    const bufferTimer = setInterval(() => {
+      if (!alive()) {
+        clearInterval(bufferTimer);
+        return;
+      }
+      updateTime();
+    }, 750);
   }
 
   function startPlayer(video, startAt, seq) {
+    currentVideo = video;
     const player = $('#playerVideo');
     const status = $('#playerStatus');
     if (!player) return;
@@ -3402,8 +3976,10 @@
       teslaBadge.hidden = false;
       teslaBadge.classList.toggle('engine', useTeslaEngine);
       teslaBadge.classList.toggle('standard', !useTeslaEngine);
-      teslaBadge.textContent = useTeslaEngine ? 'InMotion' : 'Standard video';
-      teslaBadge.title = useTeslaEngine ? 'InMotion engine is active' : 'Native video player is active';
+      teslaBadge.dataset.defaultText = useTeslaEngine ? 'InMotion' : 'Standard video';
+      teslaBadge.textContent = teslaBadge.dataset.defaultText;
+      teslaBadge.title = (useTeslaEngine ? 'InMotion engine is active' : 'Native video player is active') +
+        ' · Click to see the playback source';
     }
     if (useTeslaEngine) {
       if (window.TeslaPlayer) startTeslaEngine(video, startAt, seq);
@@ -3516,6 +4092,10 @@
       if (!saved || !saved.video || !saved.video.id) return null;
       const ttl = saved.video.live ? 30000 : 300000;
       if (Date.now() - Number(saved.at || 0) > ttl) return null;
+      if ((!saved.video.streamSource || saved.video.streamSource === 'public') && lastSource) {
+        saved.video.streamSource = lastSource.type;
+        saved.video.streamOrigin = sourceHost(lastSource.base);
+      }
       return saved.video;
     } catch (e) {
       return null;
@@ -3546,33 +4126,45 @@
     preloadTeslaLibs().catch(() => null);
     loadHls().catch(() => null);
     const hlsReady = Promise.resolve(null);
-    const cached = readWatchCache(id);
-    if (cached) {
-      if (seq !== routeSeq) return;
-      view.innerHTML = watchHTML(cached);
-      document.title = `${cached.title} - YouTube`;
-      wireWatch(cached);
-      const cachedStart = parseStart(new URLSearchParams(location.search).get('t'));
-      startPlayer(cached, cachedStart, seq);
-      return;
-    }
     let video = null;
+    let pageReady = false;
+    let loadFailed = false;
+    const renderPage = (candidate) => {
+      if (!candidate || loadFailed || pageReady || seq !== routeSeq || signal.aborted) return false;
+      pageReady = true;
+      view.innerHTML = watchHTML(candidate);
+      document.title = `${candidate.title} - YouTube`;
+      wireWatch(candidate);
+      return true;
+    };
+    const cached = readWatchCache(id);
+    if (cached && renderPage(cached)) {
+      const canUseCached = yatteeOnly()
+        ? cached.streamSource === 'yattee'
+        : !yatteeEnabled() || cached.streamSource === 'yattee' || cached.live;
+      if (canUseCached) {
+        const cachedStart = parseStart(new URLSearchParams(location.search).get('t'));
+        startPlayer(cached, cachedStart, seq);
+        return;
+      }
+    }
     try {
-      video = await loadStream(id, signal);
+      video = await loadStream(id, signal, renderPage);
     } catch (e) {
       if (signal.aborted) return;
+      loadFailed = true;
     }
     await hlsReady;
     if (seq !== routeSeq || signal.aborted) return;
     if (!video) {
+      loadFailed = true;
       document.title = 'Video unavailable - YouTube';
       view.innerHTML = watchErrorHTML(id);
       return;
     }
     writeWatchCache(video);
-    view.innerHTML = watchHTML(video);
-    document.title = `${video.title} - YouTube`;
-    wireWatch(video);
+    if (!pageReady) renderPage(video);
+    else document.title = `${video.title} - YouTube`;
     const start = parseStart(new URLSearchParams(location.search).get('t'));
     startPlayer(video, start, seq);
   }
@@ -3603,13 +4195,14 @@
     route();
   }
 
-  function normalizePlaylistVideo(item) {
+  function normalizePlaylistVideo(item, base) {
+    const thumb = (item.authorThumbnails || []).slice(-1)[0];
     return {
       id: item.videoId,
       title: item.title || 'Untitled',
       channel: item.author || 'Unknown',
       uploaderUrl: item.authorUrl || '',
-      avatar: '',
+      avatar: thumb ? absoluteURL(thumb.url, base) : '',
       views: -1,
       duration: Number(item.lengthSeconds || 0),
       live: item.liveNow === true,
@@ -3646,7 +4239,7 @@
           })
           .then((data) => {
             const videos = (data.videos || [])
-              .map(normalizePlaylistVideo)
+              .map((item) => normalizePlaylistVideo(item, base))
               .filter((video) => video && video.id);
             if (!videos.length) throw new Error('No videos');
             return { name: data.title || 'Playlist', videos };
@@ -3832,13 +4425,18 @@
     const pipedAttempts = APIS.map(async (base) => {
       const data = await apiFetch(base, `/channel/${encodeURIComponent(id)}`, signal);
       if (!data || !data.name) throw new Error('Channel unavailable');
+      const avatar = data.avatarUrl || '';
       const videos = (data.relatedStreams || [])
         .map(normalizeItem)
-        .filter((video) => video && video.id);
+        .filter((video) => video && video.id)
+        .map((video) => {
+          if (!video.avatar) video.avatar = avatar;
+          return video;
+        });
       if (!videos.length) throw new Error('No videos');
       return {
         name: data.name,
-        avatar: data.avatarUrl || '',
+        avatar,
         subscribers: Number(data.subscriberCount ?? -1),
         description: plainText(data.description || ''),
         videos,
@@ -3865,13 +4463,14 @@
         const data = await response.json();
         const author = data.author || 'Channel';
         const avatar = (data.authorThumbnails || []).slice(-1)[0];
+        const avatarURL = avatar ? absoluteURL(avatar.url, base) : '';
         const list = data.latestVideos || data.videos || [];
         const videos = list.map((item) => ({
           id: item.videoId,
           title: item.title || 'Untitled',
           channel: author,
           uploaderUrl: '',
-          avatar: '',
+          avatar: avatarURL,
           views: Number(item.viewCount ?? -1),
           duration: Number(item.lengthSeconds ?? 0),
           live: item.liveNow === true,
@@ -3881,7 +4480,7 @@
         if (!videos.length) throw new Error('No videos');
         return {
           name: author,
-          avatar: avatar ? absoluteURL(avatar.url, base) : '',
+          avatar: avatarURL,
           subscribers: Number(data.subCount ?? -1),
           description: plainText(data.description || ''),
           videos,
@@ -3958,6 +4557,9 @@
       if (liveTab && liveTab.data) {
         fetchChannelLive(liveTab.data, signal).then((liveVideos) => {
           if (seq !== routeSeq || signal.aborted || !liveVideos.length) return;
+          for (const video of liveVideos) {
+            if (!video.avatar) video.avatar = data.avatar;
+          }
           const seen = new Set();
           const merged = [];
           for (const video of [...liveVideos, ...data.videos]) {
@@ -3976,6 +4578,121 @@
     }
   }
 
+  function settingsView() {
+    const config = yatteeConfig();
+    const limit = maxDefinition();
+    document.title = 'Settings - YouTube';
+    view.innerHTML = `<div class="results-page settings-page">
+      <h1 class="search-heading">Settings</h1>
+
+      <section class="settings-section">
+        <h2>Playback</h2>
+        <label class="settings-check" for="allow1080">
+          <input type="checkbox" id="allow1080"${limit > 720 ? ' checked' : ''}>
+          <span>
+            <strong>Allow 1080p resolution when available</strong>
+            <small>720p is the default to save bandwidth and data.</small>
+          </span>
+        </label>
+        <label class="settings-check" for="yatteeOnly">
+          <input type="checkbox" id="yatteeOnly"${yatteeOnly() ? ' checked' : ''}>
+          <span>
+            <strong>Force Yattee server only as video source</strong>
+            <small>Disables public-source playback and fallback. Live streams may take longer to start.</small>
+          </span>
+        </label>
+      </section>
+
+      <section class="settings-section">
+        <h2>Yattee server</h2>
+        <p class="settings-help">Preferred source for on-demand videos. Live streams use the public source so they start immediately, unless forced above.</p>
+        <label class="settings-field" for="yatteeUrl">
+          <span>Server URL</span>
+          <input type="url" id="yatteeUrl" value="${esc(config.url)}" placeholder="${DEFAULT_YATTEE_URL}" spellcheck="false" autocapitalize="off">
+        </label>
+        <label class="settings-field" for="yatteeUser">
+          <span>Username</span>
+          <input type="text" id="yatteeUser" value="${esc(config.user)}" placeholder="${DEFAULT_YATTEE_USER}" autocomplete="username" spellcheck="false" autocapitalize="off">
+        </label>
+        <label class="settings-field" for="yatteePassword">
+          <span>Password</span>
+          <input type="password" id="yatteePassword" value="" autocomplete="current-password" placeholder="${config.password ? 'Password saved — leave blank to keep' : 'Enter password'}">
+        </label>
+        <div class="settings-actions">
+          <button type="button" class="btn settings-save" id="saveYatteeSettings">Save</button>
+          <button type="button" class="btn settings-clear" id="clearYatteeSettings">Clear</button>
+        </div>
+        <div class="settings-status" id="settingsStatus" role="status"></div>
+        <p class="settings-help settings-privacy">Credentials are stored only in this browser. Use a regular Yattee user, not an admin account. Leave the password blank and save to keep the current one.</p>
+      </section>
+    </div>`;
+
+    const status = $('#settingsStatus');
+    const urlField = $('#yatteeUrl');
+    const userField = $('#yatteeUser');
+    const passField = $('#yatteePassword');
+
+    const setStatus = (message, error = false) => {
+      status.textContent = message;
+      status.classList.toggle('error', error);
+    };
+
+    $('#allow1080').addEventListener('change', (event) => {
+      try {
+        if (event.target.checked) localStorage.setItem('youtube:allow-1080', '1');
+        else localStorage.removeItem('youtube:allow-1080');
+        localStorage.removeItem('youtube:max-height');
+      } catch (e) {}
+      clearWatchCache();
+    });
+
+    $('#yatteeOnly').addEventListener('change', (event) => {
+      try {
+        if (event.target.checked) localStorage.setItem('youtube:yattee-only', '1');
+        else localStorage.removeItem('youtube:yattee-only');
+      } catch (e) {}
+      clearWatchCache();
+    });
+
+    $('#saveYatteeSettings').addEventListener('click', () => {
+      let url = urlField.value.trim().replace(/\/+$/, '');
+      if (url) {
+        try {
+          const parsed = new URL(url);
+          if (!/^https?:$/.test(parsed.protocol)) throw new Error('Bad protocol');
+        } catch (e) {
+          setStatus('Enter a valid http or https server URL.', true);
+          return;
+        }
+      }
+      const previous = yatteeConfig();
+      const password = passField.value || previous.password || '';
+      const next = { url, user: userField.value.trim(), password };
+      if (!saveYatteeConfig(next)) {
+        setStatus('Could not save settings in this browser.', true);
+        return;
+      }
+      clearWatchCache();
+      passField.value = '';
+      passField.placeholder = password ? 'Password saved — leave blank to keep' : 'Enter password';
+      setStatus(password && next.url
+        ? 'Saved. Yattee will be tried first for videos.'
+        : password
+          ? 'Saved. Add a server URL to enable Yattee.'
+          : 'Saved. Yattee stays disabled until a password is entered.');
+    });
+
+    $('#clearYatteeSettings').addEventListener('click', () => {
+      try { localStorage.removeItem('youtube:yattee'); } catch (e) {}
+      clearWatchCache();
+      urlField.value = DEFAULT_YATTEE_URL;
+      userField.value = DEFAULT_YATTEE_USER;
+      passField.value = '';
+      passField.placeholder = 'Enter password';
+      setStatus('Yattee settings cleared. Videos will use the public servers.');
+    });
+  }
+
   async function route() {
     const seq = ++routeSeq;
     const teslaBadge = $('#teslaBadge');
@@ -3987,6 +4704,7 @@
       try { currentHls.destroy(); } catch (e) {}
       currentHls = null;
     }
+    currentVideo = null;
     if (currentEngine) {
       try { currentEngine.destroy(); } catch (e) {}
       currentEngine = null;
@@ -3998,6 +4716,7 @@
     }
     currentEnginePlayer = null;
     currentEngineSeekHandler = null;
+    hideSuggestions();
     closeGuide();
 
     const params = new URLSearchParams(location.search);
@@ -4011,6 +4730,11 @@
       updateNav('watch');
       searchInput.value = '';
       await watchView(id, seq, signal);
+    } else if (params.has('settings')) {
+      document.body.classList.remove('watch');
+      updateNav('settings');
+      searchInput.value = '';
+      settingsView();
     } else if (params.has('saved')) {
       document.body.classList.remove('watch');
       updateNav('saved');
@@ -4039,7 +4763,139 @@
     }
   }
 
+  const suggestionCache = new Map();
+  let suggestionController = null;
+  let suggestionTimer = 0;
+  let suggestionItems = [];
+  let activeSuggestion = -1;
+
+  function hideSuggestions() {
+    clearTimeout(suggestionTimer);
+    suggestionTimer = 0;
+    if (suggestionController) {
+      suggestionController.abort();
+      suggestionController = null;
+    }
+    suggestionItems = [];
+    activeSuggestion = -1;
+    searchSuggestions.hidden = true;
+    searchSuggestions.innerHTML = '';
+    searchInput.setAttribute('aria-expanded', 'false');
+  }
+
+  function paintSuggestions(items) {
+    suggestionItems = items;
+    activeSuggestion = -1;
+    searchSuggestions.innerHTML = items.map((item, index) => `
+      <button class="search-suggestion" type="button" role="option" aria-selected="false" data-suggestion-index="${index}">
+        ${icon('search')}<span>${esc(item)}</span>
+      </button>`).join('');
+    searchSuggestions.hidden = false;
+    searchInput.setAttribute('aria-expanded', 'true');
+  }
+
+  function setActiveSuggestion(index) {
+    if (!suggestionItems.length) return;
+    activeSuggestion = (index + suggestionItems.length) % suggestionItems.length;
+    [...searchSuggestions.children].forEach((item, itemIndex) => {
+      const active = itemIndex === activeSuggestion;
+      item.classList.toggle('active', active);
+      item.setAttribute('aria-selected', String(active));
+      if (active) item.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function chooseSuggestion(value) {
+    searchInput.value = value;
+    hideSuggestions();
+    searchForm.requestSubmit();
+  }
+
+  async function fetchSuggestions(query, signal) {
+    const cached = suggestionCache.get(query);
+    if (cached && Date.now() - cached.at < 120000) return cached.items;
+    const attempts = APIS.map(async (base) => {
+      const response = await fetch(
+        `${base}/suggestions?query=${encodeURIComponent(query)}`,
+        {
+          signal,
+          cache: 'no-store',
+          priority: 'high',
+          headers: { Accept: 'application/json' }
+        }
+      );
+      if (!response.ok) throw new Error('Suggestions unavailable');
+      const data = await response.json();
+      const list = Array.isArray(data)
+        ? data
+        : data && Array.isArray(data.suggestions) ? data.suggestions : [];
+      const clean = [...new Set(list
+        .filter((item) => typeof item === 'string' && item.trim())
+        .map((item) => item.trim()))].slice(0, 8);
+      if (!clean.length) throw new Error('No suggestions');
+      return clean;
+    });
+    const items = await Promise.any(attempts);
+    suggestionCache.set(query, { at: Date.now(), items });
+    if (suggestionCache.size > 30) {
+      suggestionCache.delete(suggestionCache.keys().next().value);
+    }
+    return items;
+  }
+
+  function requestSuggestions() {
+    hideSuggestions();
+    const query = searchInput.value.trim();
+    if (query.length < 2) return;
+    suggestionTimer = setTimeout(async () => {
+      const controller = new AbortController();
+      suggestionController = controller;
+      try {
+        const items = await fetchSuggestions(query, controller.signal);
+        if (controller.signal.aborted || searchInput.value.trim() !== query) return;
+        paintSuggestions(items);
+      } catch (e) {
+        if (!controller.signal.aborted) hideSuggestions();
+      }
+    }, 140);
+  }
+
+  searchInput.addEventListener('input', requestSuggestions);
+  searchInput.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (!searchSuggestions.contains(document.activeElement)) hideSuggestions();
+    }, 120);
+  });
+  searchInput.addEventListener('keydown', (event) => {
+    if (searchSuggestions.hidden || !suggestionItems.length) {
+      if (event.key === 'Escape') hideSuggestions();
+      return;
+    }
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      setActiveSuggestion(activeSuggestion + 1);
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      setActiveSuggestion(activeSuggestion - 1);
+    } else if (event.key === 'Enter' && activeSuggestion >= 0) {
+      event.preventDefault();
+      chooseSuggestion(suggestionItems[activeSuggestion]);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      hideSuggestions();
+    }
+  });
+  searchSuggestions.addEventListener('mousedown', (event) => event.preventDefault());
+  searchSuggestions.addEventListener('click', (event) => {
+    const item = event.target.closest('[data-suggestion-index]');
+    if (!item) return;
+    const index = Number(item.dataset.suggestionIndex);
+    if (Number.isInteger(index) && suggestionItems[index]) chooseSuggestion(suggestionItems[index]);
+  });
+
   searchForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    hideSuggestions();
     event.preventDefault();
     const value = searchInput.value.trim();
     if (!value) return;
@@ -4128,6 +4984,18 @@
     event.stopPropagation();
   }, true);
 
+  document.addEventListener('error', (event) => {
+    const image = event.target;
+    if (!(image instanceof HTMLImageElement) || !image.classList.contains('avatar-img')) return;
+    if (image.dataset.fallback) {
+      const fallback = image.dataset.fallback;
+      delete image.dataset.fallback;
+      image.src = fallback;
+      return;
+    }
+    image.remove();
+  }, true);
+
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') closeGuide();
   });
@@ -4152,6 +5020,32 @@
     const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
     setTheme(next);
   });
+
+  const sourceBadge = $('#teslaBadge');
+  if (sourceBadge) {
+    let flashTimer = 0;
+    const showSource = () => {
+      if (sourceBadge.hidden || !currentVideo) return;
+      const defaultText = sourceBadge.dataset.defaultText || 'InMotion';
+      if (flashTimer) clearTimeout(flashTimer);
+      sourceBadge.textContent = streamSourceLabel(currentVideo);
+      sourceBadge.classList.add('source-flash');
+      flashTimer = setTimeout(() => {
+        sourceBadge.textContent = sourceBadge.dataset.defaultText || defaultText;
+        sourceBadge.classList.remove('source-flash');
+        flashTimer = 0;
+      }, 3000);
+    };
+    sourceBadge.setAttribute('role', 'button');
+    sourceBadge.tabIndex = 0;
+    sourceBadge.addEventListener('click', showSource);
+    sourceBadge.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        showSource();
+      }
+    });
+  }
 
   window.addEventListener('popstate', route);
   document.addEventListener('visibilitychange', () => {

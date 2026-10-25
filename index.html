@@ -21,7 +21,7 @@
 <link rel="preconnect" href="https://pipedapi.dedyn.io" crossorigin>
 <link rel="preconnect" href="https://pipedproxy.dedyn.io" crossorigin>
 <link rel="preconnect" href="https://i.ytimg.com">
-<link rel="stylesheet" href="styles.css?v=20261023bi">
+<link rel="stylesheet" href="styles.css?v=20261023cy">
 </head>
 <body>
 
@@ -34,6 +34,7 @@
   <symbol id="i-music" viewBox="0 0 24 24"><path d="M9 18V6l10-2v12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><circle cx="6.5" cy="18" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="16.5" cy="16" r="2.5" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
   <symbol id="i-news" viewBox="0 0 24 24"><rect x="3" y="5" width="15" height="15" rx="1" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M18 9h3v11H6M6 8.5h9M6 12h9M6 15.5h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-podcast" viewBox="0 0 24 24"><rect x="10" y="3" width="4" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M6 11a6 6 0 0 0 12 0M12 17v4M9 21h6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <symbol id="i-settings" viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.61a.48.48 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.61c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.61c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.61c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.49.49 0 0 0-.12-.61l-2.01-1.58zM12 15.6a3.6 3.6 0 1 1 0-7.2 3.6 3.6 0 0 1 0 7.2z"/></symbol>
   <symbol id="i-playlist" viewBox="0 0 24 24"><path d="M4 7h12M4 12h12M4 17h8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path d="M16 14v6l5-3z" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-save" viewBox="0 0 24 24"><path d="M6.5 4h11a1 1 0 0 1 1 1v15l-6.5-4L5.5 20V5a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.93 4.93l1.42 1.42M17.65 17.65l1.42 1.42M19.07 4.93l-1.42 1.42M6.35 17.65l-1.42 1.42" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
@@ -84,11 +85,12 @@
   <form class="search" id="searchForm" role="search">
     <label class="sr-only" for="searchInput">Search</label>
     <div class="search-field">
-      <input id="searchInput" name="q" type="search" placeholder="Search" autocomplete="off" spellcheck="false">
+      <input id="searchInput" name="q" type="search" placeholder="Search" autocomplete="off" spellcheck="false" aria-autocomplete="list" aria-controls="searchSuggestions" aria-expanded="false">
     </div>
     <button class="search-btn" type="submit" aria-label="Search">
       <svg class="icon"><use href="#i-search"/></svg>
     </button>
+    <div class="search-suggestions" id="searchSuggestions" role="listbox" hidden></div>
   </form>
 
   <div class="topbar-end">
@@ -129,6 +131,10 @@
       <a class="guide-item" href="?q=podcasts" data-nav data-nav-key="q:podcasts" title="Podcasts">
         <svg class="icon"><use href="#i-podcast"/></svg><span class="label">Podcasts</span>
       </a>
+      <div class="guide-sep"></div>
+      <a class="guide-item" href="?settings" data-nav data-nav-key="settings" title="Settings">
+        <svg class="icon"><use href="#i-settings"/></svg><span class="label">Settings</span>
+      </a>
     </nav>
     <div class="guide-footer">
       <strong>YouTube</strong>
@@ -154,6 +160,6 @@
   </div>
 </div>
 
-<script src="app.js?v=20261023bi" defer></script>
+<script src="app.js?v=20261023cy" defer></script>
 </body>
 </html>
