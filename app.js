@@ -2535,13 +2535,144 @@
     }
   }
 
+  const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function yatteeApiBase() {
+    const config = yatteeConfig();
+    if (!config.url || !config.password) return '';
+    return config.url.replace(/\/+$/, '');
+  }
+
+  async function yatteeApiFetch(path, signal, timeout = 8000) {
+    const base = yatteeApiBase();
+    if (!base) throw new Error('Yattee is not configured');
+    const config = yatteeConfig();
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    if (signal) signal.addEventListener('abort', abort, { once: true });
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const response = await fetch(`${base}${path}`, {
+        signal: controller.signal,
+        cache: 'no-store',
+        priority: 'high',
+        headers: {
+          Accept: 'application/json',
+          Authorization: basicAuthHeader(config.user, config.password)
+        }
+      });
+      if (!response.ok) throw new Error('Yattee HTTP ' + response.status);
+      return response.json();
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', abort);
+    }
+  }
+
+  function yatteeListPath(path) {
+    let parsed;
+    try {
+      parsed = new URL(path, 'https://local.invalid');
+    } catch (e) {
+      return '';
+    }
+    if (parsed.pathname === '/trending') {
+      const region = parsed.searchParams.get('region') || REGION;
+      return `/api/v1/trending?region=${encodeURIComponent(region)}&type=Default`;
+    }
+    if (parsed.pathname === '/search') {
+      const query = parsed.searchParams.get('q') || '';
+      if (!query) return '';
+      const type = parsed.searchParams.get('filter') === 'channels' ? 'channel' : 'video';
+      return `/api/v1/search?q=${encodeURIComponent(query)}&type=${type}`;
+    }
+    return '';
+  }
+
+  function yatteeListToPiped(data, channelList) {
+    const list = Array.isArray(data) ? data : (data && Array.isArray(data.items) ? data.items : []);
+    const converted = [];
+    for (const item of list) {
+      if (!item || typeof item !== 'object') continue;
+      if (channelList) {
+        if (item.type !== 'channel' || !item.authorId) continue;
+        const thumb = (item.authorThumbnails || []).slice(-1)[0];
+        converted.push({
+          url: `/channel/${item.authorId}`,
+          type: 'channel',
+          name: item.author || 'Channel',
+          thumbnail: thumb ? thumb.url : '',
+          subscribers: Number(item.subCount ?? -1),
+          verified: item.authorVerified === true
+        });
+        continue;
+      }
+      if (item.type === 'channel' || !item.videoId) continue;
+      const thumb = (item.authorThumbnails || []).slice(-1)[0];
+      const live = item.liveNow === true;
+      converted.push({
+        url: `/watch?v=${item.videoId}`,
+        type: 'stream',
+        title: item.title || 'Untitled',
+        uploaderName: item.author || 'Unknown',
+        uploaderUrl: item.authorId ? `/channel/${item.authorId}` : '',
+        uploaderAvatar: thumb ? thumb.url : '',
+        duration: live ? -1 : Number(item.lengthSeconds || 0),
+        livestream: live,
+        views: Number(item.viewCount ?? -1),
+        uploadedDate: item.publishedText || '',
+        shortDescription: item.description || ''
+      });
+    }
+    return converted;
+  }
+
   function apiRace(path, valid, signal) {
     const attempts = APIS.map(async (base) => {
       const data = await apiFetch(base, path, signal);
       if (valid && !valid(data)) throw new Error('Unexpected response');
       return data;
     });
-    return Promise.any(attempts);
+    const publicPromise = Promise.any(attempts);
+    const channelList = path.includes('filter=channels');
+    const yatteePath = yatteeEnabled() ? yatteeListPath(path) : '';
+    if (!yatteePath) return publicPromise;
+
+    return new Promise((resolve, reject) => {
+      let done = false;
+      let primaryFailed = false;
+      let primaryError = null;
+      let fallbackStarted = false;
+      let timer = 0;
+      const finish = (data) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(data);
+      };
+      const fallback = () => {
+        if (done || fallbackStarted) return;
+        fallbackStarted = true;
+        yatteeApiFetch(yatteePath, signal).then((data) => {
+          const converted = yatteeListToPiped(data, channelList);
+          if (valid && !valid(converted)) throw new Error('Unexpected Yattee response');
+          finish(converted);
+        }).catch((e) => {
+          if (primaryFailed && !done) {
+            done = true;
+            clearTimeout(timer);
+            reject(primaryError || e);
+          }
+        });
+      };
+      timer = setTimeout(fallback, 850);
+      publicPromise.then(finish, (error) => {
+        primaryFailed = true;
+        primaryError = error;
+        clearTimeout(timer);
+        fallback();
+      });
+    });
   }
 
   async function fetchPipedCandidate(base, id, signal) {
@@ -2976,15 +3107,21 @@
       const channel = await fetchChannel(channelID, signal);
       if (!channel) return remember({ matched: false, items: [] });
       const strong = best >= 100 && Number(channel.subscribers) >= 100000;
+      const activeVideos = channel.videos
+        .filter((video) => video.live && Number(video.views) >= 0 && !video.when)
+        .slice(0, 3);
+      if (activeVideos.length) {
+        return remember({ matched: strong, items: activeVideos, channelName: channel.name });
+      }
       const tab = (channel.tabs || []).find((entry) => /live/i.test(entry.name || ''));
       if (!tab || !tab.data) {
-        return remember({ matched: strong, items: [] });
+        return remember({ matched: strong, items: [], channelName: channel.name });
       }
       const live = await fetchChannelLivePrimary(tab.data, signal);
       const active = live
         .filter((video) => video.live && Number(video.views) > 0 && !video.when)
         .slice(0, 3);
-      return remember({ matched: strong, items: active });
+      return remember({ matched: strong, items: active, channelName: channel.name });
     } catch (e) {
       if (signal && signal.aborted) return { matched: false, items: [] };
       return remember({ matched: false, items: [] });
@@ -3033,7 +3170,13 @@
       discoverChannelLive(query, items, signal).then((result) => {
         if (!result || !result.matched || seq !== routeSeq || signal.aborted) return;
         const seen = new Set();
-        const channelLive = result.items.filter((item) => {
+        const channelKey = searchKey(result.channelName || '');
+        const keepSearchLive = (item) => {
+          if (!item.live) return false;
+          if (!channelKey) return true;
+          return searchKey(item.channel) === channelKey;
+        };
+        const live = [...result.items, ...items.filter(keepSearchLive)].filter((item) => {
           if (seen.has(item.id)) return false;
           seen.add(item.id);
           return true;
@@ -3043,7 +3186,7 @@
           seen.add(item.id);
           return true;
         });
-        paintResults([...channelLive, ...videos]);
+        paintResults([...live, ...videos]);
       }).catch(() => {});
     } catch (e) {
       if (seq !== routeSeq || signal.aborted) return;
@@ -4226,6 +4369,11 @@
         })
       );
     }
+    if (yatteeEnabled()) {
+      attempts.push(
+        sleepMs(850).then(() => fetchYatteePlaylist(id, signal))
+      );
+    }
     for (const base of invidiousBases) {
       attempts.push(
         fetch(`${base}/api/v1/playlists/${encodeURIComponent(id)}?_=${Date.now()}`, {
@@ -4421,6 +4569,79 @@
     </div>`;
   }
 
+  function yatteeChannelVideo(item, author, avatar) {
+    if (!item || !item.videoId) return null;
+    return {
+      id: item.videoId,
+      title: item.title || 'Untitled',
+      channel: author,
+      uploaderUrl: item.authorId ? `/channel/${item.authorId}` : '',
+      avatar,
+      views: Number(item.viewCount ?? -1),
+      duration: Number(item.lengthSeconds || 0),
+      live: item.liveNow === true,
+      when: item.publishedText || '',
+      description: plainText(item.description || '')
+    };
+  }
+
+  async function fetchYatteeChannel(id, signal) {
+    const base = yatteeApiBase();
+    if (!base) throw new Error('Yattee unavailable');
+    const channelPath = `/api/v1/channels/${encodeURIComponent(id)}`;
+    const [meta, videosData, streamsData] = await Promise.all([
+      yatteeApiFetch(channelPath, signal),
+      yatteeApiFetch(`${channelPath}/videos`, signal).catch(() => ({ videos: [] })),
+      yatteeApiFetch(`${channelPath}/streams`, signal).catch(() => ({ videos: [] }))
+    ]);
+    if (!meta || !meta.author) throw new Error('Channel unavailable');
+    const thumb = (meta.authorThumbnails || []).slice(-1)[0];
+    const avatar = thumb ? absoluteURL(thumb.url, base) : '';
+    const seen = new Set();
+    const videos = [];
+    for (const item of [...(streamsData.videos || []), ...(videosData.videos || [])]) {
+      const video = yatteeChannelVideo(item, meta.author, avatar);
+      if (!video || seen.has(video.id)) continue;
+      seen.add(video.id);
+      videos.push(video);
+    }
+    if (!videos.length) throw new Error('No videos');
+    return {
+      name: meta.author,
+      avatar,
+      subscribers: Number(meta.subCount ?? -1),
+      description: plainText(meta.description || ''),
+      videos: videos.slice(0, 30),
+      tabs: [],
+      base
+    };
+  }
+
+  async function fetchYatteePlaylist(id, signal) {
+    const base = yatteeApiBase();
+    if (!base) throw new Error('Yattee unavailable');
+    const data = await yatteeApiFetch(`/api/v1/playlists/${encodeURIComponent(id)}`, signal);
+    const videos = (data.videos || [])
+      .map((item) => normalizePlaylistVideo(item, base))
+      .filter((video) => video && video.id);
+    if (!videos.length) throw new Error('No videos');
+    const channelIDs = [...new Set(videos
+      .map((video) => channelIDFromURL(video.uploaderUrl))
+      .filter(Boolean))].slice(0, 8);
+    await Promise.all(channelIDs.map(async (channelID) => {
+      try {
+        const meta = await yatteeApiFetch(`/api/v1/channels/${encodeURIComponent(channelID)}`, signal);
+        const thumb = (meta.authorThumbnails || []).slice(-1)[0];
+        if (!thumb) return;
+        const avatar = absoluteURL(thumb.url, base);
+        for (const video of videos) {
+          if (channelIDFromURL(video.uploaderUrl) === channelID) video.avatar = avatar;
+        }
+      } catch (e) {}
+    }));
+    return { name: data.title || 'Playlist', videos };
+  }
+
   async function fetchChannel(id, signal) {
     const pipedAttempts = APIS.map(async (base) => {
       const data = await apiFetch(base, `/channel/${encodeURIComponent(id)}`, signal);
@@ -4444,8 +4665,15 @@
         base
       };
     });
+    const pipedPromise = Promise.any(pipedAttempts);
     try {
-      return await Promise.any(pipedAttempts);
+      if (yatteeEnabled()) {
+        return await Promise.any([
+          pipedPromise,
+          sleepMs(850).then(() => fetchYatteeChannel(id, signal))
+        ]);
+      }
+      return await pipedPromise;
     } catch (e) {}
 
     const invidiousAttempts = INVIDIOUS_FALLBACK.map(async (base) => {
@@ -4814,6 +5042,14 @@
   async function fetchSuggestions(query, signal) {
     const cached = suggestionCache.get(query);
     if (cached && Date.now() - cached.at < 120000) return cached.items;
+    const cleanList = (data) => {
+      const list = Array.isArray(data)
+        ? data
+        : data && Array.isArray(data.suggestions) ? data.suggestions : [];
+      return [...new Set(list
+        .filter((item) => typeof item === 'string' && item.trim())
+        .map((item) => item.trim()))].slice(0, 8);
+    };
     const attempts = APIS.map(async (base) => {
       const response = await fetch(
         `${base}/suggestions?query=${encodeURIComponent(query)}`,
@@ -4825,17 +5061,51 @@
         }
       );
       if (!response.ok) throw new Error('Suggestions unavailable');
-      const data = await response.json();
-      const list = Array.isArray(data)
-        ? data
-        : data && Array.isArray(data.suggestions) ? data.suggestions : [];
-      const clean = [...new Set(list
-        .filter((item) => typeof item === 'string' && item.trim())
-        .map((item) => item.trim()))].slice(0, 8);
+      const clean = cleanList(await response.json());
       if (!clean.length) throw new Error('No suggestions');
       return clean;
     });
-    const items = await Promise.any(attempts);
+    const publicPromise = Promise.any(attempts);
+    let items;
+    if (yatteeEnabled()) {
+      items = await new Promise((resolve, reject) => {
+        let done = false;
+        let primaryFailed = false;
+        let primaryError = null;
+        let fallbackStarted = false;
+        let timer = 0;
+        const finish = (value) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve(value);
+        };
+        const fallback = () => {
+          if (done || fallbackStarted) return;
+          fallbackStarted = true;
+          yatteeApiFetch(`/api/v1/search/suggestions?q=${encodeURIComponent(query)}`, signal).then((data) => {
+            const clean = cleanList(data);
+            if (!clean.length) throw new Error('No suggestions');
+            finish(clean);
+          }).catch((e) => {
+            if (primaryFailed && !done) {
+              done = true;
+              clearTimeout(timer);
+              reject(primaryError || e);
+            }
+          });
+        };
+        timer = setTimeout(fallback, 850);
+        publicPromise.then(finish, (e) => {
+          primaryFailed = true;
+          primaryError = e;
+          clearTimeout(timer);
+          fallback();
+        });
+      });
+    } else {
+      items = await publicPromise;
+    }
     suggestionCache.set(query, { at: Date.now(), items });
     if (suggestionCache.size > 30) {
       suggestionCache.delete(suggestionCache.keys().next().value);
